@@ -1,9 +1,9 @@
 """
-Silicoin (SLC) CPU Miner — Optimized with C Native Keccak256
+Silicoin (SLC) CPU/GPU Miner — Optimized with C Native Keccak256 + OpenCL GPU
 Commit-Reveal scheme with Flashbots bundles for anti-frontrunning.
 
-Auto-detects CPU cores and adjusts threading/batch size accordingly.
-Supports: 1-core VPS → 64-core dedicated servers.
+Auto-detects GPU (OpenCL) → falls back to CPU (C native) → Python fallback.
+Supports: NVIDIA, AMD, Intel GPUs + any x86_64 CPU.
 """
 
 import json
@@ -106,19 +106,31 @@ def mine_worker(challenge_hex, miner_addr_hex, target_int, start_nonce, batch_si
 def mine_batch_optimized(challenge_hex, miner_addr_hex, target_int, start_nonce, batch_size):
     """
     Single-call optimized batch mining.
-    Priority: C native multi-threaded > C native single > pysha3 > eth_hash
+    Priority: GPU (OpenCL) > C native multi-threaded > pysha3 > eth_hash
     """
-    try:
-        from native_hasher import mine_batch_native, HAS_NATIVE
-    except ImportError:
-        HAS_NATIVE = False
-    
     challenge = bytes.fromhex(challenge_hex)
     miner_addr = bytes.fromhex(miner_addr_hex)
     target_bytes = target_int.to_bytes(32, 'big')
     prefix = challenge + miner_addr  # 52 bytes
     
-    # Try C native (fastest — multi-threaded at C level, bypasses GIL)
+    # Try GPU first (fastest — 100-500x over CPU)
+    if not CONFIG.get("force_cpu", False):
+        try:
+            from gpu.gpu_miner import GPUMiner
+            global _gpu_instance
+            if '_gpu_instance' not in globals() or _gpu_instance is None:
+                _gpu_instance = GPUMiner(device_idx=CONFIG.get("gpu_device", 0))
+            result = _gpu_instance.mine_batch(prefix, target_bytes, start_nonce)
+            return result if result >= 0 else None
+        except (ImportError, RuntimeError, Exception):
+            pass  # No GPU available, fall through
+    
+    # Try C native (10-30x over Python)
+    try:
+        from native_hasher import mine_batch_native, HAS_NATIVE
+    except ImportError:
+        HAS_NATIVE = False
+    
     if HAS_NATIVE:
         threads = get_optimal_threads()
         result = mine_batch_native(prefix, target_bytes, start_nonce, batch_size, threads=threads)
@@ -408,21 +420,38 @@ class SilicoinMiner:
     def run(self):
         """Main mining loop."""
         self.log("=" * 60)
-        self.log("⛏️  SILICOIN CPU MINER")
+        self.log("⛏️  SILICOIN MINER — CPU/GPU")
         self.log(f"   Miner: {self.miner_addr}")
         self.log(f"   CPU cores detected: {CPU_COUNT}")
         self.log(f"   Mining threads: {self.threads}")
         self.log(f"   Batch size: {self.batch_size:,}")
         self.log(f"   Contract: {CONFIG['contract_address']}")
         
-        # Check native hasher
-        try:
-            from native_hasher import HAS_NATIVE, get_hashrate_estimate
-            self.log(f"   Native C hasher: {'✅ Loaded' if HAS_NATIVE else '❌ Not compiled'}")
-            if HAS_NATIVE:
-                self.log(f"   Estimated speed: {get_hashrate_estimate()}")
-        except ImportError:
-            self.log("   Native C hasher: ❌ Not available (using Python fallback)")
+        # Detect mining backend
+        self.mining_mode = "python"
+        
+        if not CONFIG.get("force_cpu", False):
+            try:
+                from gpu.gpu_miner import GPUMiner
+                gpu = GPUMiner(device_idx=CONFIG.get("gpu_device", 0))
+                self.log(f"   🖥️  GPU: ✅ {gpu.device.name} ({gpu.compute_units} CU)")
+                self.log(f"   Mode: GPU (OpenCL) — ~{gpu.global_work_size:,} hashes/batch")
+                self.mining_mode = "gpu"
+            except Exception:
+                pass
+        
+        if self.mining_mode != "gpu":
+            try:
+                from native_hasher import HAS_NATIVE, get_hashrate_estimate
+                if HAS_NATIVE:
+                    self.log(f"   🔧 Backend: C native ({self.threads} threads)")
+                    self.log(f"   Estimated speed: {get_hashrate_estimate()}")
+                    self.mining_mode = "cpu_native"
+                else:
+                    self.log("   ⚠️  C native not compiled — using Python fallback (slow!)")
+                    self.log("   Compile: gcc -O3 -march=native -mavx2 -funroll-loops -lpthread -o keccak_native.so -shared -fPIC keccak_native.c")
+            except ImportError:
+                self.log("   ⚠️  native_hasher.py not found — using Python fallback (slow!)")
         
         self.log("=" * 60)
         
@@ -511,10 +540,80 @@ class SilicoinMiner:
 
 
 if __name__ == "__main__":
-    if not CONFIG.get("private_key"):
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="⛏️ Silicoin (SLC) Miner — CPU/GPU")
+    parser.add_argument("--gpu", action="store_true", help="Force GPU mining (OpenCL)")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU mining (skip GPU detection)")
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmark only, don't mine")
+    parser.add_argument("--threads", type=int, default=0, help="Override thread count (0=auto)")
+    parser.add_argument("--device", type=int, default=0, help="GPU device index (default: 0)")
+    args = parser.parse_args()
+    
+    # Override config with CLI args
+    if args.threads > 0:
+        CONFIG["threads"] = args.threads
+    if args.cpu:
+        CONFIG["force_cpu"] = True
+    if args.gpu:
+        CONFIG["force_gpu"] = True
+    CONFIG["gpu_device"] = args.device
+    
+    if args.benchmark:
+        print("=" * 60)
+        print("⛏️  SILICOIN MINER — BENCHMARK MODE")
+        print("=" * 60)
+        print()
+        
+        # Try GPU
+        if not args.cpu:
+            try:
+                from gpu.gpu_miner import GPUMiner
+                gpu = GPUMiner(device_idx=args.device)
+                print("\nBenchmarking GPU...")
+                rate = gpu.get_hashrate()
+                print(f"🏆 GPU: {rate:,.0f} H/s ({rate/1_000_000:.1f}M H/s)")
+                est = 7.5e10 / rate / 60
+                print(f"⏱️  Est. time per mine: ~{est:.1f} minutes")
+            except Exception as e:
+                print(f"GPU: ❌ {e}")
+        
+        # CPU benchmark
+        if not args.gpu:
+            print("\nBenchmarking CPU...")
+            try:
+                from native_hasher import mine_batch_native, HAS_NATIVE
+                if HAS_NATIVE:
+                    import secrets as _s
+                    prefix = _s.token_bytes(52)
+                    target = (2**200).to_bytes(32, 'big')
+                    BATCH = 2_000_000
+                    threads = get_optimal_threads()
+                    
+                    start = time.time()
+                    mine_batch_native(prefix, target, 0, BATCH, threads=threads)
+                    elapsed = time.time() - start
+                    rate = BATCH / elapsed
+                    print(f"🏆 CPU ({threads} threads, C native): {rate:,.0f} H/s ({rate/1_000_000:.2f}M H/s)")
+                    est = 7.5e10 / rate / 3600
+                    print(f"⏱️  Est. time per mine: ~{est:.1f} hours")
+                else:
+                    print("C native not compiled. Run: gcc -O3 -march=native -mavx2 -funroll-loops -lpthread -o keccak_native.so -shared -fPIC keccak_native.c")
+            except ImportError:
+                print("native_hasher.py not found")
+        
+        sys.exit(0)
+    
+    if not CONFIG.get("private_key") or CONFIG["private_key"] == "0xYOUR_PRIVATE_KEY_HERE":
         print("❌ Set 'private_key' in config.json first!")
         print("   Use a hot wallet with small ETH balance for gas.")
         print(f"   Detected {CPU_COUNT} CPU cores → will use {get_optimal_threads()} mining threads")
+        print()
+        print("Usage:")
+        print("  python3 miner.py              # Auto-detect GPU/CPU")
+        print("  python3 miner.py --gpu        # Force GPU mode")
+        print("  python3 miner.py --cpu        # Force CPU mode")
+        print("  python3 miner.py --benchmark  # Test hashrate only")
         sys.exit(1)
     
     miner = SilicoinMiner()

@@ -1,24 +1,24 @@
-# ⛏️ Silicoin (SLC) CPU Miner
+# ⛏️ Silicoin (SLC) CPU/GPU Miner
 
-Optimized CPU miner for **Silicoin** — an ERC-20 PoW token mined by AI agents on Ethereum.
+Optimized miner for **Silicoin** — an ERC-20 PoW token mined by AI agents on Ethereum.
+
+Auto-detects: **GPU (OpenCL)** → **CPU (C native)** → **Python fallback**
 
 > Contract: [`0xbb572707D09eB2E80C835D3051097E5083D460Cc`](https://etherscan.io/address/0xbb572707D09eB2E80C835D3051097E5083D460Cc)
 > Website: [silicoin.network](https://www.silicoin.network/)
 
 ## ⚡ Performance
 
-Auto-detects CPU cores and scales accordingly:
-
-| VPS Spec | Threads | Hashrate | Est. Time/Mine |
-|----------|---------|----------|----------------|
-| 1 core 1GHz (cheapest) | 1 | ~350K H/s | ~55h |
-| 2 core 2GHz (basic) | 1-2 | ~700K-1.4M H/s | ~14-28h |
-| 4 core 2.5GHz (mid) | 2-4 | ~2.5-5M H/s | ~4-8h |
-| 8 core 3GHz (strong) | 4-8 | ~8-15M H/s | ~1.3-2.5h |
-| 16 core 3.5GHz (beast) | 8-16 | ~20-40M H/s | ~30-60min |
-| 64 core (dedicated) | 32-64 | ~80-150M H/s | ~8-15min |
-
-*Estimates based on ~700K H/s per physical core at 2GHz. Actual results vary by CPU architecture.*
+| Mode | Hardware | Hashrate | Est. Time/Mine |
+|------|----------|----------|----------------|
+| **GPU** | RTX 3060 | ~50-100M H/s | ~12-25 min |
+| **GPU** | RTX 3090 | ~150-300M H/s | ~4-8 min |
+| **GPU** | RTX 4090 | ~300-500M H/s | ~2-4 min |
+| **CPU** | 2 core 2GHz | ~1-1.5M H/s | ~14-20h |
+| **CPU** | 4 core 2.5GHz | ~2.5-5M H/s | ~4-8h |
+| **CPU** | 8 core 3GHz | ~8-15M H/s | ~1.3-2.5h |
+| **CPU** | 16 core 3.5GHz | ~20-40M H/s | ~30-60 min |
+| **CPU** | 64 core (dedicated) | ~80-150M H/s | ~8-15 min |
 
 ## 🚀 Quick Start
 
@@ -34,12 +34,19 @@ gcc -O3 -march=native -mavx2 -funroll-loops -lpthread \
 # 3. Install Python deps
 pip install web3 eth-account eth-abi requests
 
-# 4. Configure
-cp config.json config.json.bak
+# 4. (Optional) GPU support
+pip install pyopencl numpy
+
+# 5. Configure
+cp config.json.example config.json
 # Edit config.json — set your private_key
 
-# 5. Run
-python3 miner.py
+# 6. Run
+python3 miner.py              # Auto-detect GPU/CPU
+python3 miner.py --gpu        # Force GPU mode
+python3 miner.py --cpu        # Force CPU mode (skip GPU)
+python3 miner.py --benchmark  # Test hashrate only
+python3 miner.py --threads 4  # Override thread count
 ```
 
 ## ⚙️ Configuration
@@ -119,11 +126,13 @@ Prevents MEV bots from frontrunning your solution. Your nonce is hidden behind a
 
 | File | Description |
 |------|-------------|
-| `miner.py` | Main miner — orchestration + blockchain interaction |
+| `miner.py` | Main miner — auto-detect GPU/CPU, blockchain interaction |
 | `keccak_native.c` | C keccak256 kernel (multi-threaded, AVX2 optimized) |
 | `native_hasher.py` | Python wrapper for C library |
-| `config.json` | Configuration (edit this) |
+| `gpu/keccak256.cl` | OpenCL GPU kernel |
+| `gpu/gpu_miner.py` | GPU miner backend (NVIDIA/AMD/Intel) |
 | `benchmark.py` | Test your hashrate |
+| `config.json.example` | Configuration template |
 
 ## 🧪 Benchmark Your Setup
 
