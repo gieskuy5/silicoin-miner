@@ -115,15 +115,32 @@ def mine_batch_optimized(challenge_hex, miner_addr_hex, target_int, start_nonce,
     
     # Try GPU first (fastest — 100-500x over CPU)
     if not CONFIG.get("force_cpu", False):
-        try:
-            from gpu.gpu_miner import GPUMiner
-            global _gpu_instance
-            if '_gpu_instance' not in globals() or _gpu_instance is None:
-                _gpu_instance = GPUMiner(device_idx=CONFIG.get("gpu_device", 0))
-            result = _gpu_instance.mine_batch(prefix, target_bytes, start_nonce)
-            return result if result >= 0 else None
-        except (ImportError, RuntimeError, Exception):
-            pass  # No GPU available, fall through
+        backend = CONFIG.get("mining_backend", "auto")
+        
+        # CUDA (NVIDIA native — fastest)
+        if backend in ("cuda", "auto"):
+            try:
+                from gpu.cuda_miner import CUDAMiner
+                global _gpu_instance
+                if '_gpu_instance' not in globals() or _gpu_instance is None:
+                    _gpu_instance = CUDAMiner(device_idx=CONFIG.get("gpu_device", 0))
+                result = _gpu_instance.mine_batch(prefix, target_bytes, start_nonce)
+                return result if result >= 0 else None
+            except (ImportError, RuntimeError, Exception):
+                if backend == "cuda":
+                    pass  # fall through to OpenCL
+        
+        # OpenCL (NVIDIA/AMD/Intel)
+        if backend in ("opencl", "auto"):
+            try:
+                from gpu.gpu_miner import GPUMiner
+                global _gpu_instance
+                if '_gpu_instance' not in globals() or _gpu_instance is None:
+                    _gpu_instance = GPUMiner(device_idx=CONFIG.get("gpu_device", 0))
+                result = _gpu_instance.mine_batch(prefix, target_bytes, start_nonce)
+                return result if result >= 0 else None
+            except (ImportError, RuntimeError, Exception):
+                pass  # No GPU available, fall through
     
     # Try C native (10-30x over Python)
     try:
@@ -542,10 +559,11 @@ class SilicoinMiner:
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="⛏️ Silicoin (SLC) Miner — CPU/GPU")
-    parser.add_argument("--gpu", action="store_true", help="Force GPU mining (OpenCL)")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU mining (skip GPU detection)")
-    parser.add_argument("--benchmark", action="store_true", help="Run benchmark only, don't mine")
+    parser = argparse.ArgumentParser(description="⛏️ Silicoin (SLC) Miner — CPU/GPU/CUDA")
+    parser.add_argument("--gpu", action="store_true", help="Skip menu, use GPU (OpenCL)")
+    parser.add_argument("--cuda", action="store_true", help="Skip menu, use GPU (CUDA)")
+    parser.add_argument("--cpu", action="store_true", help="Skip menu, use CPU")
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmark only")
     parser.add_argument("--threads", type=int, default=0, help="Override thread count (0=auto)")
     parser.add_argument("--device", type=int, default=0, help="GPU device index (default: 0)")
     args = parser.parse_args()
@@ -553,67 +571,246 @@ if __name__ == "__main__":
     # Override config with CLI args
     if args.threads > 0:
         CONFIG["threads"] = args.threads
-    if args.cpu:
-        CONFIG["force_cpu"] = True
-    if args.gpu:
-        CONFIG["force_gpu"] = True
     CONFIG["gpu_device"] = args.device
     
-    if args.benchmark:
+    # ============================================================
+    # INTERACTIVE MENU (if no --cpu/--gpu/--cuda flag)
+    # ============================================================
+    
+    def detect_hardware():
+        """Detect available mining backends."""
+        backends = []
+        
+        # Check CUDA
+        try:
+            from gpu.cuda_miner import CUDAMiner
+            cuda = CUDAMiner(device_idx=args.device, dry_run=True)
+            backends.append({
+                "id": "cuda",
+                "name": f"🟢 CUDA (NVIDIA) — {cuda.device_name}",
+                "detail": f"   {cuda.compute_units} CUDA cores | Est. ~{cuda.est_hashrate/1_000_000:.0f}M H/s",
+                "available": True
+            })
+        except Exception:
+            backends.append({
+                "id": "cuda",
+                "name": "⚫ CUDA (NVIDIA) — Not detected",
+                "detail": "   Requires: NVIDIA GPU + CUDA toolkit + pycuda",
+                "available": False
+            })
+        
+        # Check OpenCL
+        try:
+            from gpu.gpu_miner import GPUMiner
+            gpu = GPUMiner(device_idx=args.device, dry_run=True)
+            backends.append({
+                "id": "opencl",
+                "name": f"🟢 OpenCL (GPU) — {gpu.device_name}",
+                "detail": f"   {gpu.compute_units} CU | Est. ~{gpu.est_hashrate/1_000_000:.0f}M H/s",
+                "available": True
+            })
+        except Exception:
+            backends.append({
+                "id": "opencl",
+                "name": "⚫ OpenCL (GPU) — Not detected",
+                "detail": "   Requires: GPU + pyopencl",
+                "available": False
+            })
+        
+        # Check C native
+        try:
+            from native_hasher import HAS_NATIVE, get_hashrate_estimate
+            if HAS_NATIVE:
+                backends.append({
+                    "id": "cpu_native",
+                    "name": f"🟢 CPU (C native) — {CPU_COUNT} cores",
+                    "detail": f"   {get_hashrate_estimate()}",
+                    "available": True
+                })
+            else:
+                backends.append({
+                    "id": "cpu_native",
+                    "name": "🟡 CPU (C native) — Not compiled",
+                    "detail": "   Run: gcc -O3 -march=native -mavx2 -funroll-loops -lpthread -o keccak_native.so -shared -fPIC keccak_native.c",
+                    "available": False
+                })
+        except ImportError:
+            backends.append({
+                "id": "cpu_native",
+                "name": "🟡 CPU (C native) — Not found",
+                "detail": "   Compile keccak_native.c for 10-30x speedup",
+                "available": False
+            })
+        
+        # Python fallback always available
+        backends.append({
+            "id": "cpu_python",
+            "name": f"🟢 CPU (Python fallback) — {CPU_COUNT} cores",
+            "detail": "   ~50-100K H/s (slow, use as last resort)",
+            "available": True
+        })
+        
+        return backends
+    
+    def show_menu():
+        """Show interactive mining mode selection."""
+        print()
         print("=" * 60)
-        print("⛏️  SILICOIN MINER — BENCHMARK MODE")
+        print("⛏️  SILICOIN (SLC) MINER")
         print("=" * 60)
         print()
+        print("Detecting hardware...")
+        print()
         
-        # Try GPU
-        if not args.cpu:
-            try:
-                from gpu.gpu_miner import GPUMiner
-                gpu = GPUMiner(device_idx=args.device)
-                print("\nBenchmarking GPU...")
-                rate = gpu.get_hashrate()
-                print(f"🏆 GPU: {rate:,.0f} H/s ({rate/1_000_000:.1f}M H/s)")
-                est = 7.5e10 / rate / 60
-                print(f"⏱️  Est. time per mine: ~{est:.1f} minutes")
-            except Exception as e:
-                print(f"GPU: ❌ {e}")
+        backends = detect_hardware()
         
-        # CPU benchmark
-        if not args.gpu:
-            print("\nBenchmarking CPU...")
-            try:
-                from native_hasher import mine_batch_native, HAS_NATIVE
-                if HAS_NATIVE:
+        print("┌────────────────────────────────────────────────────────┐")
+        print("│  Available Mining Backends:                            │")
+        print("├────────────────────────────────────────────────────────┤")
+        
+        available_choices = []
+        for i, b in enumerate(backends):
+            num = i + 1
+            print(f"│  [{num}] {b['name']:<50}│")
+            print(f"│      {b['detail']:<50}│")
+            if b["available"]:
+                available_choices.append(b)
+        
+        print("│                                                        │")
+        print("│  [B] Benchmark all backends                            │")
+        print("│  [Q] Quit                                              │")
+        print("└────────────────────────────────────────────────────────┘")
+        print()
+        
+        while True:
+            choice = input("Select mining mode [1-4/B/Q]: ").strip().upper()
+            
+            if choice == "Q":
+                print("👋 Bye!")
+                sys.exit(0)
+            elif choice == "B":
+                return "benchmark"
+            elif choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(backends):
+                    if backends[idx]["available"]:
+                        return backends[idx]["id"]
+                    else:
+                        print(f"❌ {backends[idx]['name'].split('—')[0].strip()} is not available. Install requirements first.")
+                else:
+                    print("Invalid choice.")
+            else:
+                print("Invalid choice. Enter 1-4, B, or Q.")
+    
+    # Determine mode
+    if args.benchmark:
+        mode = "benchmark"
+    elif args.cuda:
+        mode = "cuda"
+    elif args.gpu:
+        mode = "opencl"
+    elif args.cpu:
+        mode = "cpu_native"
+    else:
+        # Check private key first
+        if not CONFIG.get("private_key") or CONFIG["private_key"] == "0xYOUR_PRIVATE_KEY_HERE":
+            print()
+            print("❌ Set 'private_key' in config.json first!")
+            print("   Use a hot wallet with small ETH balance for gas.")
+            print()
+            print("   cp config.json.example config.json")
+            print("   # Edit config.json → set private_key")
+            print()
+            sys.exit(1)
+        
+        # Show interactive menu
+        mode = show_menu()
+    
+    # Apply mode to config
+    if mode == "cuda":
+        CONFIG["mining_backend"] = "cuda"
+        CONFIG["force_cpu"] = False
+    elif mode == "opencl":
+        CONFIG["mining_backend"] = "opencl"
+        CONFIG["force_cpu"] = False
+    elif mode == "cpu_native":
+        CONFIG["mining_backend"] = "cpu"
+        CONFIG["force_cpu"] = True
+    elif mode == "cpu_python":
+        CONFIG["mining_backend"] = "cpu_python"
+        CONFIG["force_cpu"] = True
+    elif mode == "benchmark":
+        print()
+        print("=" * 60)
+        print("⛏️  SILICOIN MINER — BENCHMARK")
+        print("=" * 60)
+        
+        backends = detect_hardware()
+        for b in backends:
+            if b["available"]:
+                print(f"\n{b['name']}")
+                
+                if b["id"] == "cuda":
+                    try:
+                        from gpu.cuda_miner import CUDAMiner
+                        cuda = CUDAMiner(device_idx=args.device)
+                        rate = cuda.benchmark()
+                        print(f"  → {rate:,.0f} H/s ({rate/1_000_000:.1f}M H/s)")
+                        est = 7.5e10 / rate / 60
+                        print(f"  → Est. time per mine: ~{est:.1f} minutes")
+                    except Exception as e:
+                        print(f"  → Error: {e}")
+                
+                elif b["id"] == "opencl":
+                    try:
+                        from gpu.gpu_miner import GPUMiner
+                        gpu = GPUMiner(device_idx=args.device)
+                        rate = gpu.benchmark()
+                        print(f"  → {rate:,.0f} H/s ({rate/1_000_000:.1f}M H/s)")
+                        est = 7.5e10 / rate / 60
+                        print(f"  → Est. time per mine: ~{est:.1f} minutes")
+                    except Exception as e:
+                        print(f"  → Error: {e}")
+                
+                elif b["id"] == "cpu_native":
+                    try:
+                        from native_hasher import mine_batch_native
+                        import secrets as _s
+                        prefix = _s.token_bytes(52)
+                        target = (2**200).to_bytes(32, 'big')
+                        BATCH = 2_000_000
+                        threads = get_optimal_threads()
+                        
+                        start = time.time()
+                        mine_batch_native(prefix, target, 0, BATCH, threads=threads)
+                        elapsed = time.time() - start
+                        rate = BATCH / elapsed
+                        print(f"  → {rate:,.0f} H/s ({rate/1_000_000:.2f}M H/s) [{threads} threads]")
+                        est = 7.5e10 / rate / 3600
+                        print(f"  → Est. time per mine: ~{est:.1f} hours")
+                    except Exception as e:
+                        print(f"  → Error: {e}")
+                
+                elif b["id"] == "cpu_python":
+                    from eth_hash.auto import keccak
                     import secrets as _s
                     prefix = _s.token_bytes(52)
-                    target = (2**200).to_bytes(32, 'big')
-                    BATCH = 2_000_000
-                    threads = get_optimal_threads()
-                    
+                    BATCH_PY = 20_000
                     start = time.time()
-                    mine_batch_native(prefix, target, 0, BATCH, threads=threads)
+                    for n in range(BATCH_PY):
+                        keccak(prefix + n.to_bytes(32, 'big'))
                     elapsed = time.time() - start
-                    rate = BATCH / elapsed
-                    print(f"🏆 CPU ({threads} threads, C native): {rate:,.0f} H/s ({rate/1_000_000:.2f}M H/s)")
+                    rate = BATCH_PY / elapsed
+                    print(f"  → {rate:,.0f} H/s")
                     est = 7.5e10 / rate / 3600
-                    print(f"⏱️  Est. time per mine: ~{est:.1f} hours")
-                else:
-                    print("C native not compiled. Run: gcc -O3 -march=native -mavx2 -funroll-loops -lpthread -o keccak_native.so -shared -fPIC keccak_native.c")
-            except ImportError:
-                print("native_hasher.py not found")
+                    print(f"  → Est. time per mine: ~{est:.0f} hours (not recommended)")
         
+        print()
         sys.exit(0)
     
+    # Validate private key
     if not CONFIG.get("private_key") or CONFIG["private_key"] == "0xYOUR_PRIVATE_KEY_HERE":
         print("❌ Set 'private_key' in config.json first!")
-        print("   Use a hot wallet with small ETH balance for gas.")
-        print(f"   Detected {CPU_COUNT} CPU cores → will use {get_optimal_threads()} mining threads")
-        print()
-        print("Usage:")
-        print("  python3 miner.py              # Auto-detect GPU/CPU")
-        print("  python3 miner.py --gpu        # Force GPU mode")
-        print("  python3 miner.py --cpu        # Force CPU mode")
-        print("  python3 miner.py --benchmark  # Test hashrate only")
         sys.exit(1)
     
     miner = SilicoinMiner()

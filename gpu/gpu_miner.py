@@ -27,7 +27,7 @@ except ImportError:
 
 
 class GPUMiner:
-    def __init__(self, device_idx=0, platform_idx=None):
+    def __init__(self, device_idx=0, platform_idx=None, dry_run=False):
         """Initialize OpenCL context on specified GPU."""
         platforms = cl.get_platforms()
         
@@ -45,18 +45,29 @@ class GPUMiner:
                     platform = p
                     break
             if platform is None:
-                # Fallback to any device (CPU OpenCL)
                 platform = platforms[0]
-                print("⚠️  No GPU found, using CPU OpenCL (slower than native C)")
         
         devices = platform.get_devices(device_type=cl.device_type.GPU)
         if not devices:
-            devices = platform.get_devices()  # fallback
+            devices = platform.get_devices()
         
         if device_idx >= len(devices):
             device_idx = 0
         
         self.device = devices[device_idx]
+        self.device_name = self.device.name.strip()
+        self.compute_units = self.device.max_compute_units
+        self.est_hashrate = self.compute_units * 64 * 800  # conservative
+        
+        # Global work size estimate
+        self.global_work_size = min(
+            2**22,
+            self.device.max_work_group_size * self.compute_units * 64
+        )
+        
+        if dry_run:
+            return
+        
         self.ctx = cl.Context([self.device])
         self.queue = cl.CommandQueue(self.ctx)
         
@@ -67,18 +78,9 @@ class GPUMiner:
         
         self.program = cl.Program(self.ctx, kernel_src).build()
         
-        # Determine optimal work size
         self.max_work_group = self.device.max_work_group_size
-        self.compute_units = self.device.max_compute_units
         
-        # Global work size: saturate GPU (more work-items = better utilization)
-        # Typical: 2^20 to 2^24 depending on GPU
-        self.global_work_size = min(
-            2**22,  # 4M work-items default
-            self.device.max_work_group_size * self.compute_units * 64
-        )
-        
-        print(f"🖥️  GPU: {self.device.name}")
+        print(f"🖥️  GPU: {self.device_name}")
         print(f"   Platform: {platform.name}")
         print(f"   Compute units: {self.compute_units}")
         print(f"   Max work group: {self.max_work_group}")
@@ -139,6 +141,26 @@ class GPUMiner:
         elapsed = time.time() - start
         
         total_hashes = self.global_work_size * rounds
+        return total_hashes / elapsed
+    
+    def benchmark(self, duration=3.0) -> float:
+        """Run benchmark for `duration` seconds, return H/s."""
+        prefix = secrets.token_bytes(52)
+        target = (2**200).to_bytes(32, 'big')
+        
+        # Warmup
+        self.mine_batch(prefix, target, 0)
+        
+        total_hashes = 0
+        start = time.time()
+        nonce = self.global_work_size
+        
+        while time.time() - start < duration:
+            self.mine_batch(prefix, target, nonce)
+            total_hashes += self.global_work_size
+            nonce += self.global_work_size
+        
+        elapsed = time.time() - start
         return total_hashes / elapsed
     
     def info(self) -> dict:
