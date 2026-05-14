@@ -1,0 +1,17 @@
+{
+  "rpc_url": "https://eth.llamarpc.com",
+  "flashbots_rpc": "https://relay.flashbots.net",
+  "contract_address": "0xbb572707D09eB2E80C835D3051097E5083D460Cc",
+  "private_key": "0xYOUR_PRIVATE_KEY_HERE",
+  "threads": 0,
+  "batch_size": 0,
+  "gas_limit_commit": 55000,
+  "gas_limit_reveal": 120000,
+  "max_priority_fee_gwei": 0.1,
+  "max_fee_gwei": 5,
+  "anchor_offset": 2,
+  "auto_mine": true,
+  "use_flashbots": true,
+  "skip_if_gas_high": true,
+  "max_gas_cost_usd": 0.50
+}
